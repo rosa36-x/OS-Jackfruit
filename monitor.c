@@ -1,3 +1,7 @@
+/* 
+ * monitor.c - Multi-Container Memory Monitor (Linux Kernel Module)
+ */
+
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/fs.h>
@@ -18,6 +22,9 @@
 #define DEVICE_NAME "container_monitor"
 #define CHECK_INTERVAL_SEC 1
 
+/* ==============================================================
+ * TODO 1: Linked-list node struct
+ * ============================================================== */
 struct monitored_entry {
     pid_t pid;
     char container_id[32];
@@ -27,19 +34,25 @@ struct monitored_entry {
     struct list_head list;
 };
 
+/* ==============================================================
+ * TODO 2: Global monitored list and lock
+ * ============================================================== */
 static LIST_HEAD(monitored_list);
 static DEFINE_MUTEX(monitored_lock);
 
+/* Device + timer */
 static struct timer_list monitor_timer;
 static dev_t dev_num;
 static struct cdev c_dev;
 static struct class *cl;
 
-/* ---------- RSS ---------- */
+/* ==============================================================
+ * Helper: Get RSS
+ * ============================================================== */
 static long get_rss_bytes(pid_t pid) {
     struct task_struct *task;
     struct mm_struct *mm;
-    long rss = 0;
+    long rss_pages = 0;
 
     rcu_read_lock();
     task = pid_task(find_vpid(pid), PIDTYPE_PID);
@@ -52,48 +65,57 @@ static long get_rss_bytes(pid_t pid) {
 
     mm = get_task_mm(task);
     if (mm) {
-        rss = get_mm_rss(mm);
+        rss_pages = get_mm_rss(mm);
         mmput(mm);
     }
 
     put_task_struct(task);
-    return rss * PAGE_SIZE;
+    return rss_pages * PAGE_SIZE;
 }
 
-/* ---------- Timer ---------- */
+/* ==============================================================
+ * TODO 3: Timer Callback
+ * ============================================================== */
 static void timer_callback(struct timer_list *t) {
-    struct monitored_entry *e, *tmp;
+    struct monitored_entry *entry, *tmp;
     long rss;
 
     mutex_lock(&monitored_lock);
 
-    list_for_each_entry_safe(e, tmp, &monitored_list, list) {
-        rss = get_rss_bytes(e->pid);
+    list_for_each_entry_safe(entry, tmp, &monitored_list, list) {
 
+        /* Process exited → remove */
+        rss = get_rss_bytes(entry->pid);
         if (rss < 0) {
-            list_del(&e->list);
-            kfree(e);
+            list_del(&entry->list);
+            kfree(entry);
             continue;
         }
 
-        if ((unsigned long)rss > e->hard_limit_bytes) {
+        /* Hard limit → kill */
+        if ((unsigned long)rss > entry->hard_limit_bytes) {
             struct task_struct *task;
+
             rcu_read_lock();
-            task = pid_task(find_vpid(e->pid), PIDTYPE_PID);
+            task = pid_task(find_vpid(entry->pid), PIDTYPE_PID);
             if (task)
                 send_sig(SIGKILL, task, 1);
             rcu_read_unlock();
 
-            printk(KERN_WARNING "[HARD LIMIT] %s pid=%d\n", e->container_id, e->pid);
+            printk(KERN_WARNING "[HARD LIMIT] %s pid=%d\n",
+                   entry->container_id, entry->pid);
 
-            list_del(&e->list);
-            kfree(e);
+            list_del(&entry->list);
+            kfree(entry);
             continue;
         }
 
-        if ((unsigned long)rss > e->soft_limit_bytes && !e->soft_warned) {
-            printk(KERN_WARNING "[SOFT LIMIT] %s pid=%d\n", e->container_id, e->pid);
-            e->soft_warned = 1;
+        /* Soft limit → warn once */
+        if ((unsigned long)rss > entry->soft_limit_bytes &&
+            !entry->soft_warned) {
+            printk(KERN_WARNING "[SOFT LIMIT] %s pid=%d\n",
+                   entry->container_id, entry->pid);
+            entry->soft_warned = 1;
         }
     }
 
@@ -102,7 +124,9 @@ static void timer_callback(struct timer_list *t) {
     mod_timer(&monitor_timer, jiffies + CHECK_INTERVAL_SEC * HZ);
 }
 
-/* ---------- IOCTL ---------- */
+/* ==============================================================
+ * TODO 4: IOCTL handler
+ * ============================================================== */
 static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
     struct monitor_request req;
 
@@ -110,55 +134,64 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
         return -EFAULT;
 
     if (cmd == MONITOR_REGISTER) {
-        struct monitored_entry *e;
 
+        /* Validate limits */
         if (req.soft_limit_bytes > req.hard_limit_bytes)
             return -EINVAL;
 
-        e = kmalloc(sizeof(*e), GFP_KERNEL);
-        if (!e) return -ENOMEM;
+        /* Allocate entry */
+        struct monitored_entry *entry =
+            kmalloc(sizeof(*entry), GFP_KERNEL);
+        if (!entry) return -ENOMEM;
 
-        e->pid = req.pid;
-        e->soft_limit_bytes = req.soft_limit_bytes;
-        e->hard_limit_bytes = req.hard_limit_bytes;
-        e->soft_warned = 0;
+        entry->pid = req.pid;
+        entry->soft_limit_bytes = req.soft_limit_bytes;
+        entry->hard_limit_bytes = req.hard_limit_bytes;
+        entry->soft_warned = 0;
 
-        strncpy(e->container_id, req.container_id, 31);
-        e->container_id[31] = '\0';
+        strncpy(entry->container_id, req.container_id, 31);
+        entry->container_id[31] = '\0';
 
-        INIT_LIST_HEAD(&e->list);
+        INIT_LIST_HEAD(&entry->list);
 
+        /* Insert into list */
         mutex_lock(&monitored_lock);
-        list_add_tail(&e->list, &monitored_list);
+        list_add_tail(&entry->list, &monitored_list);
         mutex_unlock(&monitored_lock);
 
         return 0;
     }
 
     if (cmd == MONITOR_UNREGISTER) {
-        struct monitored_entry *e, *tmp;
 
+        struct monitored_entry *entry, *tmp;
+
+        /* Remove entry */
         mutex_lock(&monitored_lock);
-        list_for_each_entry_safe(e, tmp, &monitored_list, list) {
-            if (e->pid == req.pid) {
-                list_del(&e->list);
-                kfree(e);
+        list_for_each_entry_safe(entry, tmp, &monitored_list, list) {
+            if (entry->pid == req.pid) {
+                list_del(&entry->list);
+                kfree(entry);
                 break;
             }
         }
         mutex_unlock(&monitored_lock);
+
         return 0;
     }
 
     return -EINVAL;
 }
 
+/* File ops */
 static struct file_operations fops = {
     .owner = THIS_MODULE,
     .unlocked_ioctl = monitor_ioctl,
 };
 
+/* Init */
 static int __init monitor_init(void) {
+
     alloc_chrdev_region(&dev_num, 0, 1, DEVICE_NAME);
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,4,0)
@@ -179,15 +212,18 @@ static int __init monitor_init(void) {
     return 0;
 }
 
+/* ==============================================================
+ * TODO 6: Cleanup
+ * ============================================================== */
 static void __exit monitor_exit(void) {
-    struct monitored_entry *e, *tmp;
+    struct monitored_entry *entry, *tmp;
 
     del_timer_sync(&monitor_timer);
 
     mutex_lock(&monitored_lock);
-    list_for_each_entry_safe(e, tmp, &monitored_list, list) {
-        list_del(&e->list);
-        kfree(e);
+    list_for_each_entry_safe(entry, tmp, &monitored_list, list) {
+        list_del(&entry->list);
+        kfree(entry);
     }
     mutex_unlock(&monitored_lock);
 
@@ -201,4 +237,5 @@ static void __exit monitor_exit(void) {
 
 module_init(monitor_init);
 module_exit(monitor_exit);
+
 MODULE_LICENSE("GPL");
