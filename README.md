@@ -5,7 +5,7 @@
 | Name | SRN |
 |---|---|
 | Divya Gupta | PES2UG24CS901 |
-| Rosalin Verma | PES2UG24CS678 |
+| Rosalin Verma | PES2UG24CS655 |
 
 **Course:** UE24CS242B — Operating Systems
 **Institution:** PES University, Bengaluru
