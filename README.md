@@ -254,7 +254,7 @@ Lower nice value results in higher CPU priority, demonstrating Linux scheduling 
 
 ## 10. GitHub Repository
 
-https://github.com/divyaguptamo/OS-Jackfruit
+https://github.com/rosa36-x/OS-Jackfruit
 
 ---
 
